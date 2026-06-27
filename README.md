@@ -4,13 +4,19 @@ Lupe is an ordered implementation queue for agentic development. Add markdown wo
 
 ## Install
 
+Lupe requires [Bun](https://bun.sh) on your PATH.
+
+Install globally:
+
 ```bash
-bun add -d lupe
+bun install -g @mattfca/lupe
+lupe --help
 ```
 
-Then run Lupe from your project root:
+Or add it to a project:
 
 ```bash
+bun add -d @mattfca/lupe
 bunx lupe --help
 ```
 
@@ -68,7 +74,7 @@ This copies `SCOPE.md` into `lupe-queue/<timestamp>_initial_scope.md` and scaffo
 `lupe.config.ts` exports a config object:
 
 ```ts
-import type { UserLupeConfig } from "lupe";
+import type { UserLupeConfig } from "@mattfca/lupe";
 
 const config: UserLupeConfig = {
   input: {

@@ -51,6 +51,7 @@ describe("scaffold templates", () => {
   });
 
   test("renders concise config and work item templates", () => {
+    expect(renderConfigTemplate()).toContain('from "@mattfca/lupe"');
     expect(renderConfigTemplate()).toContain('dir: "lupe-queue"');
     expect(renderConfigTemplate()).toContain("subagents: true");
     expect(renderInitialWorkItemTemplate()).toContain("# Initial Scope");

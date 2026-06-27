@@ -30,7 +30,7 @@ export function workItemFilename(date: Date, slug: string): string {
 }
 
 export function renderConfigTemplate(): string {
-  return `import type { UserLupeConfig } from "lupe";
+  return `import type { UserLupeConfig } from "@mattfca/lupe";
 
 const config: UserLupeConfig = {
   input: {

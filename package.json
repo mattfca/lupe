@@ -1,9 +1,17 @@
 {
-  "name": "lupe",
+  "name": "@mattfca/lupe",
   "version": "0.1.0",
   "description": "Ordered implementation queue for agentic development.",
   "type": "module",
+  "author": "Matt Fraser",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mattfca/lupe.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "agent",
     "cursor",
@@ -17,7 +25,7 @@
     "README.md"
   ],
   "bin": {
-    "lupe": "./bin/lupe"
+    "lupe": "bin/lupe"
   },
   "main": "./dist/index.js",
   "types": "./src/index.ts",
