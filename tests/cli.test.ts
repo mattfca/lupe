@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { parseArgv, runCli } from "../src/cli/index";
+import { parseRunArgs } from "../src/cli/commands/run";
 import { createInitialState, saveState } from "../src/state/store";
 
 describe("CLI router", () => {
@@ -115,6 +116,13 @@ describe("CLI router", () => {
     expect(parsed.commandArgs).toEqual(["--future-command-flag"]);
     expect(parsed.flags.cwd).toBe("/repo/demo");
     expect(parsed.flags.verbose).toBe(true);
+  });
+
+  test("parses run drain flags", () => {
+    expect(parseRunArgs(["--all"])).toEqual({ all: true, autoAccept: false });
+    expect(parseRunArgs(["--all", "--auto-accept"])).toEqual({ all: true, autoAccept: true });
+    expect(() => parseRunArgs(["--auto-accept"])).toThrow("requires --all");
+    expect(() => parseRunArgs(["--bogus"])).toThrow('Unknown run option "--bogus"');
   });
 });
 

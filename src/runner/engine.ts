@@ -5,6 +5,7 @@ import type { AgentAdapter } from "../agent";
 import { createCursorAgentAdapter } from "../agent/cursor";
 import type { LupeConfig } from "../config/schema";
 import { createPhaseWorktree } from "../git";
+import type { PullRequestInfo, PullRequestProvider } from "../git/pr";
 import {
   generateBatchReviewPackage,
   recordBatchReviewDecision,
@@ -12,6 +13,7 @@ import {
 } from "../integration/batch";
 import { integrationBranchName } from "../integration/merge";
 import { integrateAndReviewWorkItem, transitionReviewGenerated } from "../integration/review";
+import { acceptWorkItem } from "../lifecycle/accept";
 import type { PersistedPlan, PersistedPlanPhase } from "../planner/persist";
 import { resolveWorkItemPlanPaths } from "../planner/persist";
 import { planWorkItem, syncQueueIntoState } from "../planner/plan";
@@ -53,11 +55,61 @@ export interface RunEngineResult {
   integrationBranch?: string;
 }
 
+export interface RunQueueOptions extends RunEngineOptions {
+  autoAccept?: boolean;
+  prProvider?: PullRequestProvider;
+}
+
+export type RunQueueStoppedReason = "idle" | "halted";
+
+export interface RunQueueProcessedItem {
+  workItemId: string;
+  status: WorkItemState["status"];
+  phasesRun: string[];
+  resumed: boolean;
+  reviewPackage?: string;
+  integrationBranch?: string;
+  pr?: PullRequestInfo;
+}
+
+export interface RunQueueResult {
+  processed: RunQueueProcessedItem[];
+  stoppedReason: RunQueueStoppedReason;
+}
+
 interface PreparedPhase {
   phase: PersistedPlanPhase;
   branch: string;
   worktreePath: string;
 }
+
+interface RunSession {
+  cwd: string;
+  config: LupeConfig;
+  agent: AgentAdapter;
+  queueItems: readonly WorkItem[];
+  runId: string;
+  logger?: Logger;
+  now?: Date;
+  postPhaseHook?: (context: PostPhaseHookContext) => Promise<void> | void;
+  getState: () => State;
+  setState: (state: State) => void;
+  commitState: (fn: (current: State) => State) => Promise<State>;
+}
+
+type ProcessSelectionResult =
+  | {
+      kind: "none";
+    }
+  | {
+      kind: "processed";
+      workItemId: string;
+      finalStatus: WorkItemState["status"];
+      phasesRun: string[];
+      resumed: boolean;
+      reviewPackage?: string;
+      integrationBranch?: string;
+    };
 
 export async function runEngine(options: RunEngineOptions): Promise<RunEngineResult> {
   const cwd = resolve(options.cwd ?? process.cwd());
@@ -65,40 +117,17 @@ export async function runEngine(options: RunEngineOptions): Promise<RunEngineRes
 
   return await withLock(
     async (handle) => {
-      const queue = await loadQueue(options.config, {
-        cwd,
-        ...(options.logger === undefined ? {} : { logger: options.logger })
-      });
-      let state = syncQueueIntoState(queue.items, await loadState({ cwd, config: options.config }), {
-        immutableCompleted: options.config.input.immutableCompleted,
-        ...(options.logger === undefined ? {} : { logger: options.logger })
-      });
-      await saveState(state, { cwd, config: options.config });
-      let stateWrite = Promise.resolve();
-      const commitState = async (fn: (current: State) => State): Promise<State> => {
-        let committed = state;
-        stateWrite = stateWrite.then(async () => {
-          committed = fn(state);
-          await saveState(committed, { cwd, config: options.config });
-          state = committed;
-        });
-        await stateWrite;
-        return committed;
-      };
-
-      const initialResume = detectInProgressRun(state);
-      const selected = await selectOrPlanWorkItem({
+      const session = await createRunSession({
         cwd,
         config: options.config,
         agent,
-        queueItems: queue.items,
-        state,
+        runId: handle.metadata.run,
         ...(options.logger === undefined ? {} : { logger: options.logger }),
-        ...(options.now === undefined ? {} : { now: options.now })
+        ...(options.now === undefined ? {} : { now: options.now }),
+        ...(options.postPhaseHook === undefined ? {} : { postPhaseHook: options.postPhaseHook })
       });
-
-      state = selected.state;
-      if (selected.workItem === null) {
+      const result = await processCurrentSelection(session);
+      if (result.kind === "none") {
         options.logger?.info("No planned work items to run.");
         return {
           workItemId: null,
@@ -107,201 +136,363 @@ export async function runEngine(options: RunEngineOptions): Promise<RunEngineRes
         };
       }
 
-      const workItem = selected.workItem;
-      const persistedPlan = selected.plan;
-      const phaseById = new Map(persistedPlan.phases.map((phase) => [phase.id, phase]));
-      const resumed = initialResume?.workItem.id === workItem.id || selected.itemState.status === "running";
-      const integrationBranch = integrationBranchName(workItem.id);
-
-      if (selected.itemState.status === "verified") {
-        const finalization = await finalizeVerifiedWorkItem({
-          cwd,
-          config: options.config,
-          workItem,
-          persistedPlan,
-          state,
-          commitState,
-          ...(options.logger === undefined ? {} : { logger: options.logger }),
-          ...(options.now === undefined ? {} : { now: options.now })
-        });
-        state = finalization.state;
-        return {
-          workItemId: workItem.id,
-          phasesRun: [],
-          resumed: false,
-          ...(finalization.reviewPackage === undefined ? {} : { reviewPackage: finalization.reviewPackage }),
-          ...(finalization.integrationBranch === undefined ? {} : { integrationBranch: finalization.integrationBranch })
-        };
-      }
-
-      state = await commitState((current) =>
-        startOrResumeWorkItem(current, workItem.id, handle.metadata.run, integrationBranch, resumed)
-      );
-      state = await commitState((current) =>
-        updateWorkItemPhases(current, workItem.id, normalizeResumablePhases(requirePhases(current, workItem.id)))
-      );
-
-      if (allPhasesVerified(requirePhases(state, workItem.id))) {
-        state = await commitState((current) => transition(current, workItem.id, { type: "verify_passed" }));
-        const finalization = await finalizeVerifiedWorkItem({
-          cwd,
-          config: options.config,
-          workItem,
-          persistedPlan,
-          state,
-          commitState,
-          ...(options.logger === undefined ? {} : { logger: options.logger }),
-          ...(options.now === undefined ? {} : { now: options.now })
-        });
-        state = finalization.state;
-        return {
-          workItemId: workItem.id,
-          phasesRun: [],
-          resumed,
-          ...(finalization.reviewPackage === undefined ? {} : { reviewPackage: finalization.reviewPackage }),
-          ...(finalization.integrationBranch === undefined ? {} : { integrationBranch: finalization.integrationBranch })
-        };
-      }
-
-      const prepared = await preparePhaseWorktrees({
-        cwd,
-        workItemId: workItem.id,
-        phases: requirePhases(state, workItem.id),
-        phaseById
-      });
-
-      state = await commitState((current) =>
-        updateWorkItemPhases(
-          current,
-          workItem.id,
-          requirePhases(current, workItem.id).map((phase) => {
-            const branch = prepared.get(phase.id)?.branch ?? phase.branch;
-            return branch === undefined ? phase : { ...phase, branch };
-          })
-        )
-      );
-
-      const phasesRun: string[] = [];
-
-      await runPhaseScheduler({
-        maxParallelPhases: options.config.maxParallelPhases,
-        phases: () =>
-          requireWorkItem(state, workItem.id).status === "running" ? requirePhases(state, workItem.id) : [],
-        runPhase: async (phaseState) => {
-          const phase = phaseById.get(phaseState.id);
-          const worktree = prepared.get(phaseState.id);
-          if (phase === undefined || worktree === undefined) {
-            throw new UsageError(`Missing persisted plan or worktree for phase "${phaseState.id}".`);
-          }
-
-          state = await commitState((current) =>
-            markPhaseRunning(current, workItem.id, phaseState.id, worktree.branch)
-          );
-
-          try {
-            const result = await runPhase({
-              cwd,
-              config: options.config,
-              agent,
-              workItem,
-              phase,
-              branch: worktree.branch,
-              worktreePath: worktree.worktreePath
-            });
-            await options.postPhaseHook?.({
-              cwd,
-              config: options.config,
-              workItem,
-              phase,
-              result
-            });
-            const currentItem = requireWorkItem(state, workItem.id);
-            if (currentItem.status !== "running") {
-              return result;
-            }
-
-            const verification = await verifyAndRepairPhase({
-              cwd,
-              config: options.config,
-              agent,
-              workItem,
-              phase,
-              branch: worktree.branch,
-              worktreePath: worktree.worktreePath,
-              runId: result.runId,
-              artifacts: result.artifacts,
-              initialRepairAttempts: currentItem.repairAttempts ?? 0,
-              onRepairAttempt: async (repairAttempts) => {
-                state = await commitState((current) => {
-                  const item = requireWorkItem(current, workItem.id);
-                  if (item.status !== "running") {
-                    return current;
-                  }
-                  return transition(current, workItem.id, {
-                    type: "verify_failed",
-                    repairAttempts,
-                    currentPhase: phaseState.id
-                  });
-                });
-              }
-            });
-            phasesRun.push(phaseState.id);
-            if (verification.status === "rejected") {
-              state = await commitState((current) => {
-                const item = requireWorkItem(current, workItem.id);
-                if (item.status !== "running") {
-                  return current;
-                }
-                const failed = markPhaseFailed(current, workItem.id, phaseState.id);
-                return transition(failed, workItem.id, {
-                  type: "repair_budget_exhausted",
-                  rejectedAt: new Date().toISOString(),
-                  ...(verification.reason === undefined ? {} : { reason: verification.reason })
-                });
-              });
-              options.logger?.info(`Rejected ${workItem.id} after verification failed for ${phaseState.id}.`);
-              return result;
-            }
-
-            state = await commitState((current) =>
-              requireWorkItem(current, workItem.id).status === "running"
-                ? markPhaseVerified(current, workItem.id, phaseState.id)
-                : current
-            );
-            options.logger?.info(`Completed ${workItem.id} ${phaseState.id}.`);
-            return result;
-          } catch (error) {
-            state = await commitState((current) =>
-              markPhaseFailed(current, workItem.id, phaseState.id)
-            );
-            throw error;
-          }
-        }
-      });
-
-      options.logger?.info(`Ran ${phasesRun.length} phase(s) for ${workItem.id}.`);
-      const finalization = await finalizeVerifiedWorkItem({
-        cwd,
-        config: options.config,
-        workItem,
-        persistedPlan,
-        state,
-        commitState,
-        ...(options.logger === undefined ? {} : { logger: options.logger }),
-        ...(options.now === undefined ? {} : { now: options.now })
-      });
-      state = finalization.state;
-
       return {
-        workItemId: workItem.id,
-        phasesRun,
-        resumed,
-        ...(finalization.reviewPackage === undefined ? {} : { reviewPackage: finalization.reviewPackage }),
-        ...(finalization.integrationBranch === undefined ? {} : { integrationBranch: finalization.integrationBranch })
+        workItemId: result.workItemId,
+        phasesRun: result.phasesRun,
+        resumed: result.resumed,
+        ...(result.reviewPackage === undefined ? {} : { reviewPackage: result.reviewPackage }),
+        ...(result.integrationBranch === undefined ? {} : { integrationBranch: result.integrationBranch })
       };
     },
     { cwd }
   );
+}
+
+export async function runQueue(options: RunQueueOptions): Promise<RunQueueResult> {
+  const cwd = resolve(options.cwd ?? process.cwd());
+  const agent = options.agent ?? createCursorAgentAdapter();
+  const shouldAutoAccept = options.autoAccept === true || options.config.autoAccept;
+
+  return await withLock(
+    async (handle) => {
+      const session = await createRunSession({
+        cwd,
+        config: options.config,
+        agent,
+        runId: handle.metadata.run,
+        ...(options.logger === undefined ? {} : { logger: options.logger }),
+        ...(options.now === undefined ? {} : { now: options.now }),
+        ...(options.postPhaseHook === undefined ? {} : { postPhaseHook: options.postPhaseHook })
+      });
+      const processed: RunQueueProcessedItem[] = [];
+
+      while (true) {
+        const result = await processCurrentSelection(session);
+        if (result.kind === "none") {
+          return {
+            processed,
+            stoppedReason: "idle"
+          };
+        }
+
+        const processedItem: RunQueueProcessedItem = {
+          workItemId: result.workItemId,
+          status: result.finalStatus,
+          phasesRun: result.phasesRun,
+          resumed: result.resumed,
+          ...(result.reviewPackage === undefined ? {} : { reviewPackage: result.reviewPackage }),
+          ...(result.integrationBranch === undefined ? {} : { integrationBranch: result.integrationBranch })
+        };
+        processed.push(processedItem);
+
+        const current = session.getState().current;
+        if (result.finalStatus === "rejected" || current.status === "halted") {
+          return {
+            processed,
+            stoppedReason: "halted"
+          };
+        }
+
+        if (result.finalStatus === "in_review" && shouldAutoAccept) {
+          const accepted = await acceptWorkItem({
+            cwd,
+            config: options.config,
+            ...(options.prProvider === undefined ? {} : { prProvider: options.prProvider }),
+            ...(options.logger === undefined ? {} : { logger: options.logger }),
+            ...(options.now === undefined ? {} : { now: options.now })
+          });
+          processedItem.status = "accepted";
+          processedItem.pr = accepted.pr;
+          session.setState(await loadState({ cwd, config: options.config }));
+        }
+      }
+    },
+    { cwd }
+  );
+}
+
+async function createRunSession(options: {
+  cwd: string;
+  config: LupeConfig;
+  agent: AgentAdapter;
+  runId: string;
+  logger?: Logger;
+  now?: Date;
+  postPhaseHook?: (context: PostPhaseHookContext) => Promise<void> | void;
+}): Promise<RunSession> {
+  const queue = await loadQueue(options.config, {
+    cwd: options.cwd,
+    ...(options.logger === undefined ? {} : { logger: options.logger })
+  });
+  let state = syncQueueIntoState(queue.items, await loadState({ cwd: options.cwd, config: options.config }), {
+    immutableCompleted: options.config.input.immutableCompleted,
+    ...(options.logger === undefined ? {} : { logger: options.logger })
+  });
+  await saveState(state, { cwd: options.cwd, config: options.config });
+  let stateWrite = Promise.resolve();
+
+  return {
+    cwd: options.cwd,
+    config: options.config,
+    agent: options.agent,
+    queueItems: queue.items,
+    runId: options.runId,
+    ...(options.logger === undefined ? {} : { logger: options.logger }),
+    ...(options.now === undefined ? {} : { now: options.now }),
+    ...(options.postPhaseHook === undefined ? {} : { postPhaseHook: options.postPhaseHook }),
+    getState: () => state,
+    setState(next) {
+      state = next;
+    },
+    async commitState(fn) {
+      let committed = state;
+      stateWrite = stateWrite.then(async () => {
+        committed = fn(state);
+        await saveState(committed, { cwd: options.cwd, config: options.config });
+        state = committed;
+      });
+      await stateWrite;
+      return committed;
+    }
+  };
+}
+
+async function processCurrentSelection(session: RunSession): Promise<ProcessSelectionResult> {
+  const initialResume = detectInProgressRun(session.getState());
+  const selected = await selectOrPlanWorkItem({
+    cwd: session.cwd,
+    config: session.config,
+    agent: session.agent,
+    queueItems: session.queueItems,
+    state: session.getState(),
+    ...(session.logger === undefined ? {} : { logger: session.logger }),
+    ...(session.now === undefined ? {} : { now: session.now })
+  });
+
+  session.setState(selected.state);
+  if (selected.workItem === null) {
+    return { kind: "none" };
+  }
+
+  const workItem = selected.workItem;
+  const persistedPlan = selected.plan;
+  const phaseById = new Map(persistedPlan.phases.map((phase) => [phase.id, phase]));
+  const resumed = initialResume?.workItem.id === workItem.id || selected.itemState.status === "running";
+  const integrationBranch = integrationBranchName(workItem.id);
+
+  if (selected.itemState.status === "verified") {
+    const finalization = await finalizeVerifiedWorkItem({
+      cwd: session.cwd,
+      config: session.config,
+      workItem,
+      persistedPlan,
+      state: session.getState(),
+      commitState: session.commitState,
+      ...(session.logger === undefined ? {} : { logger: session.logger }),
+      ...(session.now === undefined ? {} : { now: session.now })
+    });
+    session.setState(finalization.state);
+    const item = requireWorkItem(session.getState(), workItem.id);
+    return {
+      kind: "processed",
+      workItemId: workItem.id,
+      finalStatus: item.status,
+      phasesRun: [],
+      resumed: false,
+      ...(finalization.reviewPackage === undefined ? {} : { reviewPackage: finalization.reviewPackage }),
+      ...(finalization.integrationBranch === undefined ? {} : { integrationBranch: finalization.integrationBranch })
+    };
+  }
+
+  session.setState(
+    await session.commitState((current) =>
+      startOrResumeWorkItem(current, workItem.id, session.runId, integrationBranch, resumed)
+    )
+  );
+  session.setState(
+    await session.commitState((current) =>
+      updateWorkItemPhases(current, workItem.id, normalizeResumablePhases(requirePhases(current, workItem.id)))
+    )
+  );
+
+  if (allPhasesVerified(requirePhases(session.getState(), workItem.id))) {
+    session.setState(
+      await session.commitState((current) => transition(current, workItem.id, { type: "verify_passed" }))
+    );
+    const finalization = await finalizeVerifiedWorkItem({
+      cwd: session.cwd,
+      config: session.config,
+      workItem,
+      persistedPlan,
+      state: session.getState(),
+      commitState: session.commitState,
+      ...(session.logger === undefined ? {} : { logger: session.logger }),
+      ...(session.now === undefined ? {} : { now: session.now })
+    });
+    session.setState(finalization.state);
+    const item = requireWorkItem(session.getState(), workItem.id);
+    return {
+      kind: "processed",
+      workItemId: workItem.id,
+      finalStatus: item.status,
+      phasesRun: [],
+      resumed,
+      ...(finalization.reviewPackage === undefined ? {} : { reviewPackage: finalization.reviewPackage }),
+      ...(finalization.integrationBranch === undefined ? {} : { integrationBranch: finalization.integrationBranch })
+    };
+  }
+
+  const prepared = await preparePhaseWorktrees({
+    cwd: session.cwd,
+    workItemId: workItem.id,
+    phases: requirePhases(session.getState(), workItem.id),
+    phaseById
+  });
+
+  session.setState(
+    await session.commitState((current) =>
+      updateWorkItemPhases(
+        current,
+        workItem.id,
+        requirePhases(current, workItem.id).map((phase) => {
+          const branch = prepared.get(phase.id)?.branch ?? phase.branch;
+          return branch === undefined ? phase : { ...phase, branch };
+        })
+      )
+    )
+  );
+
+  const phasesRun: string[] = [];
+
+  await runPhaseScheduler({
+    maxParallelPhases: session.config.maxParallelPhases,
+    phases: () =>
+      requireWorkItem(session.getState(), workItem.id).status === "running"
+        ? requirePhases(session.getState(), workItem.id)
+        : [],
+    runPhase: async (phaseState) => {
+      const phase = phaseById.get(phaseState.id);
+      const worktree = prepared.get(phaseState.id);
+      if (phase === undefined || worktree === undefined) {
+        throw new UsageError(`Missing persisted plan or worktree for phase "${phaseState.id}".`);
+      }
+
+      session.setState(
+        await session.commitState((current) =>
+          markPhaseRunning(current, workItem.id, phaseState.id, worktree.branch)
+        )
+      );
+
+      try {
+        const result = await runPhase({
+          cwd: session.cwd,
+          config: session.config,
+          agent: session.agent,
+          workItem,
+          phase,
+          branch: worktree.branch,
+          worktreePath: worktree.worktreePath
+        });
+        await session.postPhaseHook?.({
+          cwd: session.cwd,
+          config: session.config,
+          workItem,
+          phase,
+          result
+        });
+        const currentItem = requireWorkItem(session.getState(), workItem.id);
+        if (currentItem.status !== "running") {
+          return result;
+        }
+
+        const verification = await verifyAndRepairPhase({
+          cwd: session.cwd,
+          config: session.config,
+          agent: session.agent,
+          workItem,
+          phase,
+          branch: worktree.branch,
+          worktreePath: worktree.worktreePath,
+          runId: result.runId,
+          artifacts: result.artifacts,
+          initialRepairAttempts: currentItem.repairAttempts ?? 0,
+          onRepairAttempt: async (repairAttempts) => {
+            session.setState(
+              await session.commitState((current) => {
+                const item = requireWorkItem(current, workItem.id);
+                if (item.status !== "running") {
+                  return current;
+                }
+                return transition(current, workItem.id, {
+                  type: "verify_failed",
+                  repairAttempts,
+                  currentPhase: phaseState.id
+                });
+              })
+            );
+          }
+        });
+        phasesRun.push(phaseState.id);
+        if (verification.status === "rejected") {
+          session.setState(
+            await session.commitState((current) => {
+              const item = requireWorkItem(current, workItem.id);
+              if (item.status !== "running") {
+                return current;
+              }
+              const failed = markPhaseFailed(current, workItem.id, phaseState.id);
+              return transition(failed, workItem.id, {
+                type: "repair_budget_exhausted",
+                rejectedAt: new Date().toISOString(),
+                ...(verification.reason === undefined ? {} : { reason: verification.reason })
+              });
+            })
+          );
+          session.logger?.info(`Rejected ${workItem.id} after verification failed for ${phaseState.id}.`);
+          return result;
+        }
+
+        session.setState(
+          await session.commitState((current) =>
+            requireWorkItem(current, workItem.id).status === "running"
+              ? markPhaseVerified(current, workItem.id, phaseState.id)
+              : current
+          )
+        );
+        session.logger?.info(`Completed ${workItem.id} ${phaseState.id}.`);
+        return result;
+      } catch (error) {
+        session.setState(
+          await session.commitState((current) => markPhaseFailed(current, workItem.id, phaseState.id))
+        );
+        throw error;
+      }
+    }
+  });
+
+  session.logger?.info(`Ran ${phasesRun.length} phase(s) for ${workItem.id}.`);
+  const finalization = await finalizeVerifiedWorkItem({
+    cwd: session.cwd,
+    config: session.config,
+    workItem,
+    persistedPlan,
+    state: session.getState(),
+    commitState: session.commitState,
+    ...(session.logger === undefined ? {} : { logger: session.logger }),
+    ...(session.now === undefined ? {} : { now: session.now })
+  });
+  session.setState(finalization.state);
+  const item = requireWorkItem(session.getState(), workItem.id);
+
+  return {
+    kind: "processed",
+    workItemId: workItem.id,
+    finalStatus: item.status,
+    phasesRun,
+    resumed,
+    ...(finalization.reviewPackage === undefined ? {} : { reviewPackage: finalization.reviewPackage }),
+    ...(finalization.integrationBranch === undefined ? {} : { integrationBranch: finalization.integrationBranch })
+  };
 }
 
 async function selectOrPlanWorkItem(options: {

@@ -251,7 +251,12 @@ export {
   runEngine,
   type PostPhaseHookContext,
   type RunEngineOptions,
-  type RunEngineResult
+  type RunEngineResult,
+  runQueue,
+  type RunQueueOptions,
+  type RunQueueProcessedItem,
+  type RunQueueResult,
+  type RunQueueStoppedReason
 } from "./runner/engine";
 export {
   renderPhasePrompt,

@@ -54,7 +54,9 @@ This copies `SCOPE.md` into `lupe-queue/<timestamp>_initial_scope.md` and scaffo
 - `lupe migrate`: Convert an existing `SCOPE.md` into the first queued work item.
 - `lupe new "<title>"`: Create a UTC timestamped work item template.
 - `lupe plan [--all] [target]`: Plan phases for the first unplanned item, all unplanned items, or a specific item.
-- `lupe run`: Run planned phases, verify them, repair within budget, and generate a review package.
+- `lupe run`: Run one planned item, verify its phases, repair within budget, and generate a review package.
+- `lupe run --all`: Drain runnable queue items in order, leaving each completed item in review unless auto-accept is enabled.
+- `lupe run --all --auto-accept`: Drain the queue and open one PR per completed item, even when `autoAccept` is false.
 - `lupe review`: Print the current final-review package summary.
 - `lupe accept`: Open a PR for the integration branch and advance the queue.
 - `lupe reject [reason]`: Reject the current item and halt the queue.

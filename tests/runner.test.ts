@@ -17,12 +17,13 @@ import { createMockAgentAdapter } from "../src/agent";
 import { DEFAULT_CONFIG, type LupeConfig } from "../src/config/schema";
 import { INPUT_DIR } from "../src/fs/contract";
 import { runGit } from "../src/git";
+import type { OpenPullRequestOptions, PullRequestInfo, PullRequestProvider } from "../src/git/pr";
 import { buildPhaseGraph } from "../src/planner/graph";
 import { persistPlanArtifacts } from "../src/planner/persist";
 import { loadQueue } from "../src/queue/discover";
 import type { WorkItem } from "../src/queue/workItem";
 import { createRunArtifacts, completeRunArtifacts } from "../src/runner/artifacts";
-import { runEngine } from "../src/runner/engine";
+import { runEngine, runQueue } from "../src/runner/engine";
 import { runPhaseScheduler, selectReadyPhases } from "../src/runner/scheduler";
 import type { PhaseState, State } from "../src/state/schema";
 import { createInitialState, loadState, saveState } from "../src/state/store";
@@ -388,6 +389,181 @@ describe("run engine integration", () => {
     expect(verification).toContain("Status: failed, repair budget exhausted");
     expect(verification).toContain("Verification After Repair 2");
   });
+
+  test("runQueue drains multiple items to in_review without opening PRs by default", async () => {
+    const cwd = makeTempDir();
+    writeQueueFile(cwd, "20260626T160000_first.md", "# First\n");
+    writeQueueFile(cwd, "20260626T161000_second.md", "# Second\n");
+    await initGitRepo(cwd);
+
+    const config = testConfig({
+      maxParallelPhases: 1,
+      subagents: false,
+      skills: false,
+      verify: ["test -f done.txt"]
+    });
+    const agent = createMockAgentAdapter(
+      {
+        phases: [{ id: "phase-001", title: "Implement", goal: "Write done marker" }]
+      },
+      async (_workItem, _phase, context) => {
+        await writeFile(join(context.worktreePath, "done.txt"), "done\n");
+        return { output: "done" };
+      }
+    );
+
+    const result = await runQueue({
+      cwd,
+      config,
+      agent
+    });
+    const state = await loadState({ cwd, config });
+
+    expect(result.stoppedReason).toBe("idle");
+    expect(result.processed.map((item) => item.workItemId)).toEqual([
+      "20260626T160000_first",
+      "20260626T161000_second"
+    ]);
+    expect(result.processed.map((item) => item.status)).toEqual(["in_review", "in_review"]);
+    expect(state.workItems.map((item) => item.status)).toEqual(["in_review", "in_review"]);
+    expect(state.workItems.every((item) => item.finalReview !== undefined)).toBe(true);
+  });
+
+  test("runQueue auto-accepts every completed item with a fake PR provider", async () => {
+    const cwd = makeTempDir();
+    writeQueueFile(cwd, "20260626T170000_first_auto.md", "# First auto\n");
+    writeQueueFile(cwd, "20260626T171000_second_auto.md", "# Second auto\n");
+    await initGitRepo(cwd);
+
+    const config = testConfig({
+      maxParallelPhases: 1,
+      subagents: false,
+      skills: false,
+      verify: ["test -f done.txt"]
+    });
+    const provider = new FakePullRequestProvider();
+    const agent = createMockAgentAdapter(
+      {
+        phases: [{ id: "phase-001", title: "Implement", goal: "Write done marker" }]
+      },
+      async (_workItem, _phase, context) => {
+        await writeFile(join(context.worktreePath, "done.txt"), "done\n");
+        return { output: "done" };
+      }
+    );
+
+    const result = await runQueue({
+      cwd,
+      config,
+      agent,
+      autoAccept: true,
+      prProvider: provider,
+      now: new Date("2026-06-26T17:30:00.000Z")
+    });
+    const state = await loadState({ cwd, config });
+
+    expect(result.stoppedReason).toBe("idle");
+    expect(result.processed.map((item) => item.status)).toEqual(["accepted", "accepted"]);
+    expect(provider.calls).toHaveLength(2);
+    expect(provider.calls.map((call) => call.base)).toEqual(["main", "main"]);
+    expect(provider.calls.map((call) => call.head)).toEqual([
+      "lupe/20260626T170000_first_auto",
+      "lupe/20260626T171000_second_auto"
+    ]);
+    expect(state.workItems.map((item) => item.status)).toEqual(["accepted", "accepted"]);
+    expect(state.current).toEqual({ status: "idle" });
+  });
+
+  test("runQueue halts when an item exhausts verification repair budget", async () => {
+    const cwd = makeTempDir();
+    writeQueueFile(cwd, "20260626T180000_bad.md", "# Bad\n");
+    writeQueueFile(cwd, "20260626T181000_later.md", "# Later\n");
+    await initGitRepo(cwd);
+
+    const config = testConfig({
+      maxParallelPhases: 1,
+      maxRepairAttempts: 1,
+      subagents: false,
+      skills: false,
+      verify: ["test -f never.txt"]
+    });
+    const agent = createMockAgentAdapter(
+      {
+        phases: [{ id: "phase-001", title: "Bad", goal: "Stay failing" }]
+      },
+      () => ({ output: "no marker" }),
+      () => ({ output: "still no marker" })
+    );
+
+    const result = await runQueue({
+      cwd,
+      config,
+      agent
+    });
+    const state = await loadState({ cwd, config });
+
+    expect(result.stoppedReason).toBe("halted");
+    expect(result.processed.map((item) => item.workItemId)).toEqual(["20260626T180000_bad"]);
+    expect(result.processed[0]?.status).toBe("rejected");
+    expect(state.workItems.map((item) => item.status)).toEqual(["rejected", "discovered"]);
+    expect(state.current).toEqual({ status: "halted", workItem: "20260626T180000_bad" });
+  });
+
+  test("runQueue resumes an in-progress item and then continues through the queue", async () => {
+    const cwd = makeTempDir();
+    writeQueueFile(cwd, "20260626T190000_resume_all.md", "# Resume all\n");
+    writeQueueFile(cwd, "20260626T191000_after_resume.md", "# After resume\n");
+    await initGitRepo(cwd);
+
+    const config = testConfig({ maxParallelPhases: 1, verify: ["test -f done.txt"] });
+    const workItem = await firstQueueItem(cwd, config);
+    const phases = buildPhaseGraph([
+      { id: "phase-001", title: "Done", goal: "Already done" },
+      { id: "phase-002", title: "Resume", goal: "Resume this", deps: ["phase-001"] }
+    ]);
+    await persistPlanArtifacts(workItem, phases, { cwd });
+    await runGit(cwd, ["branch", `lupe/${workItem.id}/phase-001`]);
+    const state = crashedState(config, workItem);
+    state.workItems.push({
+      id: "20260626T191000_after_resume",
+      status: "discovered",
+      planned: false,
+      verified: false,
+      fileHash: "after-hash"
+    });
+    await saveState(state, { cwd, config });
+
+    const executed: string[] = [];
+    const agent = createMockAgentAdapter(
+      {
+        phases: [{ id: "phase-001", title: "After", goal: "Run after resume" }]
+      },
+      async (workItemArg, phase, context) => {
+        executed.push(`${workItemArg.id}:${phase.id}`);
+        await writeFile(join(context.worktreePath, "done.txt"), "done\n");
+        return { output: `done ${phase.id}` };
+      }
+    );
+
+    const result = await runQueue({
+      cwd,
+      config,
+      agent
+    });
+    const saved = await loadState({ cwd, config });
+
+    expect(result.stoppedReason).toBe("idle");
+    expect(result.processed.map((item) => item.workItemId)).toEqual([
+      "20260626T190000_resume_all",
+      "20260626T191000_after_resume"
+    ]);
+    expect(result.processed[0]?.resumed).toBe(true);
+    expect(executed).toEqual([
+      "20260626T190000_resume_all:phase-002",
+      "20260626T191000_after_resume:phase-001"
+    ]);
+    expect(saved.workItems.map((item) => item.status)).toEqual(["in_review", "in_review"]);
+  });
 });
 
 function makeTempDir(): string {
@@ -494,4 +670,20 @@ function refreshTestReadiness(phases: PhaseState[]): PhaseState[] {
 
 async function delay(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+class FakePullRequestProvider implements PullRequestProvider {
+  readonly calls: OpenPullRequestOptions[] = [];
+
+  async openPullRequest(options: OpenPullRequestOptions): Promise<PullRequestInfo> {
+    this.calls.push(options);
+    return {
+      provider: "fake",
+      url: `https://example.com/pull/${this.calls.length}`,
+      base: options.base,
+      head: options.head,
+      number: this.calls.length,
+      title: options.title
+    };
+  }
 }
