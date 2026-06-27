@@ -1,0 +1,42 @@
+{
+  "name": "lupe",
+  "version": "0.1.0",
+  "description": "Ordered implementation queue for agentic development.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "agent",
+    "cursor",
+    "automation",
+    "queue"
+  ],
+  "files": [
+    "bin",
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "bin": {
+    "lupe": "./bin/lupe"
+  },
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "lint": "tsc --noEmit",
+    "build": "bun build ./src/cli/index.ts ./src/index.ts --outdir ./dist --target bun --format esm",
+    "release": "bun run typecheck && bun run lint && bun test && bun run build",
+    "prepublishOnly": "bun run release"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}
